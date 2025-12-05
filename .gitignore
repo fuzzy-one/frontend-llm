@@ -1,4 +1,18 @@
-logs/
+# Python
 __pycache__/
-llm-api/__pycache__
-llm-api/__pycache__/main.cpython-311.pyc
+*.pyc
+*.pyo
+.env
+
+# Virtual environment
+venv/
+
+# Logs
+logs/
+
+# IDE
+.vscode/
+.idea/
+
+# Archive
+_archive/

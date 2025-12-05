@@ -1,0 +1,679 @@
+# api/search.py - Core search logic
+# LLM parsing + OpenSearch query building + result formatting
+
+import re
+import json
+import httpx
+import requests
+import unicodedata
+from copy import deepcopy
+from typing import Dict, Any, Optional, List
+from datetime import datetime, timezone
+
+from .config import settings
+from .models import (
+    SearchResult, SearchFilters, SearchFeatures,
+    ListingAttributes, ListingCoordinates
+)
+
+# =============================================================================
+# CONSTANTS
+# =============================================================================
+
+VALID_TRANSACTIONS = ["Vanzare", "Inchiriere"]
+VALID_PROPERTY_TYPES = ["Apartamente", "Case", "Garsoniera", "Terenuri", "Vile", "Spatii", "Birou"]
+
+KNOWN_CITIES = {
+    "bucuresti": "Bucuresti", "bucharest": "Bucuresti",
+    "timisoara": "Timis", "cluj": "Cluj", "cluj-napoca": "Cluj",
+    "iasi": "Iasi", "constanta": "Constanta", "brasov": "Brasov",
+    "sibiu": "Sibiu", "oradea": "Bihor", "craiova": "Dolj",
+    "arad": "Arad", "ploiesti": "Prahova",
+}
+
+FEATURE_PATTERNS = {
+    "animale": {
+        "positive_boost": "accepta animale pet friendly pisici caini animale de companie se accepta animal",
+        "negative_patterns": [
+            "nu se accepta animale", "nu se acceptă animale", "nu accept animale",
+            "nu accepta animale", "nu acceptam animale", "fara animale", "fără animale",
+            "exclus animale", "nu se accepta animale de companie", "nu accept animale de companie",
+            "nu sunt acceptate animale", "nu se acceptă animale de companie",
+        ]
+    },
+    "fumatori": {
+        "positive_boost": "fumatori acceptati se poate fuma accept fumatori",
+        "negative_patterns": [
+            "nu accept fumatori", "nu accept fumători", "fara fumatori", "fără fumători",
+            "nefumatori", "non fumatori", "nu se fumeaza", "interzis fumatul", "exclus fumatori",
+        ]
+    },
+    "parcare": {
+        "positive_boost": "loc parcare garaj parcare inclusa parcare subterana boxa",
+        "negative_patterns": ["fara parcare", "fără parcare", "nu are parcare"]
+    },
+    "mobilat": {
+        "positive_boost": "mobilat complet utilat mobilat modern complet mobilat",
+        "negative_patterns": ["nemobilat", "neutilat", "fara mobila", "fără mobilă", "gol"]
+    },
+    "centrala": {
+        "positive_boost": "centrala proprie centrala termica incalzire autonoma",
+        "negative_patterns": ["fara centrala", "încălzire centralizată"]
+    },
+}
+
+
+# =============================================================================
+# UTILITIES
+# =============================================================================
+
+def strip_diacritics(text: str) -> str:
+    """Remove Romanian diacritics"""
+    if not text:
+        return text
+    normalized = unicodedata.normalize('NFD', text)
+    return ''.join(c for c in normalized if unicodedata.category(c) != 'Mn')
+
+
+def normalize_city(city: str) -> Optional[str]:
+    """Normalize city name to match location_1 field"""
+    if not city:
+        return None
+    city_lower = strip_diacritics(city.lower().strip())
+    if city_lower in KNOWN_CITIES:
+        return KNOWN_CITIES[city_lower]
+    for key, value in KNOWN_CITIES.items():
+        if strip_diacritics(key) == city_lower:
+            return value
+    return city.strip().title()
+
+
+def validate_transaction(t: str) -> Optional[str]:
+    if not t:
+        return None
+    t = strip_diacritics(t.strip().lower())
+    if t in ["vanzare", "vand", "cumpar", "cumparare", "vânzare"]:
+        return "Vanzare"
+    elif t in ["inchiriere", "inchiriez", "chirie", "închiriere"]:
+        return "Inchiriere"
+    return None
+
+
+def validate_property_type(p: str) -> Optional[str]:
+    if not p:
+        return None
+    p = strip_diacritics(p.strip().lower())
+    if p in ["apartament", "apartamente", "ap"]:
+        return "Apartamente"
+    elif p in ["casa", "case", "vila", "vile"]:
+        return "Case"
+    elif p in ["garsoniera", "garsoniere", "studio"]:
+        return "Garsoniera"
+    elif p in ["teren", "terenuri"]:
+        return "Terenuri"
+    return None
+
+
+# =============================================================================
+# MEMORY FUNCTIONS
+# =============================================================================
+
+def create_empty_memory() -> Dict[str, Any]:
+    """Create fresh memory state"""
+    return {
+        "location": None, "city": None, "transaction": None,
+        "property_type": None, "rooms": None, "price_min": None,
+        "price_max": None, "keywords": [],
+        "features": {
+            "animale": None, "fumatori": None, "parcare": None,
+            "mobilat": None, "centrala": None,
+        }
+    }
+
+
+def load_memory(user_id: str, session_id: str) -> Dict[str, Any]:
+    """Load memory from OpenSearch"""
+    doc_id = f"{user_id}_{session_id}"
+    try:
+        response = requests.get(
+            f"{settings.opensearch_url}/{settings.memory_index}/_doc/{doc_id}",
+            auth=settings.opensearch_auth,
+            verify=settings.opensearch_verify_ssl,
+            timeout=5
+        )
+        if response.status_code == 200:
+            return response.json()["_source"].get("filters", create_empty_memory())
+    except:
+        pass
+    return create_empty_memory()
+
+
+def save_memory(user_id: str, session_id: str, filters: Dict, query: str = None):
+    """Save memory to OpenSearch"""
+    doc_id = f"{user_id}_{session_id}"
+    now = datetime.now(timezone.utc).isoformat()
+    
+    # Get existing to preserve history
+    try:
+        existing = requests.get(
+            f"{settings.opensearch_url}/{settings.memory_index}/_doc/{doc_id}",
+            auth=settings.opensearch_auth,
+            verify=settings.opensearch_verify_ssl,
+            timeout=5
+        )
+        query_history = []
+        created_at = now
+        if existing.status_code == 200:
+            src = existing.json()["_source"]
+            query_history = src.get("query_history", [])
+            created_at = src.get("created_at", now)
+    except:
+        query_history = []
+        created_at = now
+    
+    if query:
+        query_history.append({"q": query, "ts": now})
+        query_history = query_history[-50:]  # Keep last 50
+    
+    doc = {
+        "user_id": user_id,
+        "session_id": session_id,
+        "filters": filters,
+        "query_history": query_history,
+        "created_at": created_at,
+        "updated_at": now
+    }
+    
+    requests.put(
+        f"{settings.opensearch_url}/{settings.memory_index}/_doc/{doc_id}",
+        json=doc,
+        auth=settings.opensearch_auth,
+        verify=settings.opensearch_verify_ssl,
+        timeout=5
+    )
+
+
+def delete_memory(user_id: str, session_id: str) -> bool:
+    """Delete session memory"""
+    doc_id = f"{user_id}_{session_id}"
+    try:
+        response = requests.delete(
+            f"{settings.opensearch_url}/{settings.memory_index}/_doc/{doc_id}",
+            auth=settings.opensearch_auth,
+            verify=settings.opensearch_verify_ssl,
+            timeout=5
+        )
+        return response.status_code in [200, 404]
+    except:
+        return False
+
+
+def ensure_memory_index():
+    """Create memory index if it doesn't exist"""
+    mapping = {
+        "settings": {"number_of_shards": 1, "number_of_replicas": 0},
+        "mappings": {
+            "properties": {
+                "user_id": {"type": "keyword"},
+                "session_id": {"type": "keyword"},
+                "filters": {"type": "object", "enabled": False},
+                "query_history": {"type": "nested", "properties": {
+                    "q": {"type": "text"},
+                    "ts": {"type": "date"}
+                }},
+                "created_at": {"type": "date"},
+                "updated_at": {"type": "date"}
+            }
+        }
+    }
+    
+    try:
+        response = requests.head(
+            f"{settings.opensearch_url}/{settings.memory_index}",
+            auth=settings.opensearch_auth,
+            verify=settings.opensearch_verify_ssl
+        )
+        if response.status_code == 404:
+            requests.put(
+                f"{settings.opensearch_url}/{settings.memory_index}",
+                json=mapping,
+                auth=settings.opensearch_auth,
+                verify=settings.opensearch_verify_ssl
+            )
+    except:
+        pass
+
+
+# =============================================================================
+# LLM PARSING
+# =============================================================================
+
+def parse_query_with_llm(user_query: str, current_context: Dict) -> Dict:
+    """Use LLM to parse natural language query"""
+    
+    context_str = json.dumps(current_context, ensure_ascii=False, indent=2)
+    
+    prompt = f'''You are a Romanian real estate search parser. Parse the user's query into structured JSON.
+
+CURRENT SEARCH CONTEXT:
+{context_str}
+
+USER QUERY: "{user_query}"
+
+RULES:
+1. If the query REFINES the search (starts with "dar", "si", "doar", "numai"), preserve context and modify only mentioned fields
+2. If the query is a NEW search (mentions a new location or completely different criteria), start fresh
+3. For features (animale, fumatori, parcare, mobilat, centrala):
+   - "WANT" = user wants this feature
+   - "EXCLUDE" = user doesn't want this
+   - null = not mentioned
+
+OUTPUT FORMAT (JSON only):
+{{
+  "location": "neighborhood or null",
+  "city": "city or null",
+  "transaction": "Vanzare" or "Inchiriere" or null,
+  "property_type": "Apartamente" or "Case" or "Garsoniera" or null,
+  "rooms": number or null,
+  "price_min": number or null,
+  "price_max": number or null,
+  "keywords": ["array of terms: modern, balcon, etc."],
+  "features": {{
+    "animale": "WANT" or "EXCLUDE" or null,
+    "fumatori": "WANT" or "EXCLUDE" or null,
+    "parcare": "WANT" or "EXCLUDE" or null,
+    "mobilat": "WANT" or "EXCLUDE" or null,
+    "centrala": "WANT" or "EXCLUDE" or null
+  }}
+}}
+
+Parse and output ONLY JSON:'''
+
+    try:
+        response = httpx.post(
+            f"{settings.ollama_url}/api/generate",
+            json={
+                "model": settings.ollama_model,
+                "prompt": prompt,
+                "stream": False,
+                "options": {"temperature": 0.1, "num_predict": 500}
+            },
+            timeout=settings.ollama_timeout
+        )
+        
+        result = response.json()["response"].strip()
+        
+        # Extract JSON
+        if "```" in result:
+            match = re.search(r'```(?:json)?\s*([\s\S]*?)\s*```', result)
+            if match:
+                result = match.group(1)
+        
+        start = result.find("{")
+        end = result.rfind("}") + 1
+        if start >= 0 and end > start:
+            result = result[start:end]
+        
+        # Clean common issues
+        result = re.sub(r',\s*}', '}', result)
+        result = re.sub(r',\s*]', ']', result)
+        result = result.replace('\n', ' ')
+        
+        parsed = json.loads(result)
+        return validate_parsed_result(parsed, current_context)
+        
+    except Exception as e:
+        print(f"LLM parsing error: {e}")
+        return current_context
+
+
+def validate_parsed_result(parsed: Dict, context: Dict) -> Dict:
+    """Validate and normalize LLM output"""
+    result = deepcopy(context)
+    
+    if parsed.get("location"):
+        result["location"] = strip_diacritics(parsed["location"])
+    if parsed.get("city"):
+        result["city"] = normalize_city(parsed["city"])
+    if parsed.get("transaction"):
+        v = validate_transaction(parsed["transaction"])
+        if v:
+            result["transaction"] = v
+    if parsed.get("property_type"):
+        v = validate_property_type(parsed["property_type"])
+        if v:
+            result["property_type"] = v
+    if parsed.get("rooms") is not None:
+        rooms = parsed["rooms"]
+        if isinstance(rooms, int) and 1 <= rooms <= 5:
+            result["rooms"] = rooms
+    if parsed.get("price_min") is not None:
+        result["price_min"] = int(parsed["price_min"]) if parsed["price_min"] else None
+    if parsed.get("price_max") is not None:
+        result["price_max"] = int(parsed["price_max"]) if parsed["price_max"] else None
+    
+    # Keywords - merge
+    if parsed.get("keywords"):
+        existing = set(result.get("keywords", []) or [])
+        new = set(parsed["keywords"]) if isinstance(parsed["keywords"], list) else set()
+        result["keywords"] = list(existing | new)
+    
+    # Features
+    if parsed.get("features"):
+        for f in ["animale", "fumatori", "parcare", "mobilat", "centrala"]:
+            val = parsed["features"].get(f)
+            if val in ["WANT", "EXCLUDE"]:
+                result["features"][f] = val
+            elif val is None and f in parsed["features"]:
+                result["features"][f] = None
+    
+    return result
+
+
+# =============================================================================
+# OPENSEARCH QUERY BUILDER
+# =============================================================================
+
+def build_opensearch_query(parsed: Dict, size: int = 25) -> Dict:
+    """Build OpenSearch query from parsed filters"""
+    
+    must = []
+    should = []
+    must_not = []
+    
+    # Location
+    location = parsed.get("location")
+    if location:
+        loc_lower = location.lower()
+        if "sector" in loc_lower:
+            match = re.search(r'(\d+)', location)
+            if match:
+                sector_num = match.group(1)
+                must.append({
+                    "bool": {
+                        "should": [
+                            {"term": {"location_2": f"Sector {sector_num}"}},
+                            {"term": {"location_2": f"Sectorul {sector_num}"}}
+                        ],
+                        "minimum_should_match": 1
+                    }
+                })
+        else:
+            must.append({
+                "bool": {
+                    "should": [
+                        {"term": {"location_3": {"value": location, "boost": 3.0}}},
+                        {"match": {"location_3": {"query": location, "fuzziness": "AUTO", "boost": 2.5}}},
+                        {"match": {"driver_title": {"query": location, "boost": 2.0}}},
+                        {"match": {"description": {"query": location, "boost": 1.0}}}
+                    ],
+                    "minimum_should_match": 1
+                }
+            })
+    
+    if parsed.get("city"):
+        must.append({"term": {"location_1": parsed["city"]}})
+    
+    if parsed.get("transaction"):
+        must.append({"term": {"categories": parsed["transaction"]}})
+    
+    if parsed.get("property_type"):
+        must.append({"term": {"categories": parsed["property_type"]}})
+    
+    if parsed.get("rooms"):
+        rooms = parsed["rooms"]
+        if rooms == 1:
+            must.append({
+                "bool": {
+                    "should": [
+                        {"term": {"categories": "1 camere"}},
+                        {"term": {"categories": "Garsoniera"}}
+                    ],
+                    "minimum_should_match": 1
+                }
+            })
+        else:
+            must.append({"term": {"categories": f"{rooms} camere"}})
+    
+    # Price range
+    price_filter = {}
+    if parsed.get("price_min"):
+        price_filter["gte"] = parsed["price_min"]
+    if parsed.get("price_max"):
+        price_filter["lte"] = parsed["price_max"]
+    if price_filter:
+        must.append({"range": {"price": price_filter}})
+    
+    # Keywords
+    for kw in parsed.get("keywords", []):
+        must.append({
+            "bool": {
+                "should": [
+                    {"match": {"driver_title": {"query": kw, "boost": 2.0}}},
+                    {"match": {"description": {"query": kw, "boost": 1.0}}}
+                ],
+                "minimum_should_match": 1
+            }
+        })
+    
+    # Features
+    features = parsed.get("features", {})
+    neural_boost_texts = []
+    
+    for fname, fval in features.items():
+        if not fval or fname not in FEATURE_PATTERNS:
+            continue
+        pattern = FEATURE_PATTERNS[fname]
+        if fval == "WANT":
+            neural_boost_texts.append(pattern["positive_boost"])
+            for phrase in pattern["negative_patterns"]:
+                must_not.append({"match_phrase": {"description": phrase}})
+        elif fval == "EXCLUDE":
+            neural_boost_texts.extend(pattern["negative_patterns"][:3])
+    
+    if neural_boost_texts:
+        should.append({
+            "neural": {
+                "listing_vector": {
+                    "query_text": " ".join(neural_boost_texts),
+                    "model_id": settings.embedding_model_id,
+                    "k": 100
+                }
+            }
+        })
+    
+    # Build final query
+    query = {
+        "size": size,
+        "query": {
+            "bool": {
+                "must": must if must else [{"match_all": {}}],
+            }
+        },
+        "_source": [
+            "driver_title", "name", "description", "price", "currency",
+            "location_1", "location_2", "location_3", "coordinates",
+            "ad_url", "ad_id", "categories", "attributes",
+            "src_images", "images", "decrypted_phone", "source", "ad_source",
+            "valid_from", "user_name"
+        ]
+    }
+    
+    if should:
+        query["query"]["bool"]["should"] = should
+        query["query"]["bool"]["minimum_should_match"] = 0
+    if must_not:
+        query["query"]["bool"]["must_not"] = must_not
+    
+    return query
+
+
+# =============================================================================
+# RESULT FORMATTING
+# =============================================================================
+
+def get_relevance_tag(score: float, max_score: float) -> str:
+    """Convert score to emoji tag"""
+    if max_score == 0:
+        return "⚪"
+    pct = (score / max_score) * 100
+    if pct >= 90:
+        return "🟢"
+    elif pct >= 70:
+        return "🟡"
+    elif pct >= 50:
+        return "🟠"
+    else:
+        return "🔴"
+
+
+def extract_attributes(attrs: Dict[str, Any]) -> ListingAttributes:
+    """Extract and normalize attributes"""
+    if not attrs:
+        return ListingAttributes()
+    
+    mapping = {
+        "Suprafata utila": "surface", "Suprafata": "surface",
+        "Etaj": "floor", "Numar camere": "rooms",
+        "Compartimentare": "layout", "Stare interior": "condition",
+        "Sistem incalzire": "heating", "Incalzire": "heating",
+        "Electrocasnice": "appliances", "Locuri parcare": "parking",
+        "An constructie": "year_built", "Numar bai": "bathrooms",
+        "Disponibilitate proprietate": "availability",
+    }
+    
+    result = {}
+    for key, value in attrs.items():
+        clean_key = mapping.get(key)
+        if clean_key and isinstance(value, str):
+            result[clean_key] = value.replace("\r\n", " ").replace("\n", " ").strip()
+    
+    return ListingAttributes(**result)
+
+
+def format_result(hit: Dict, max_score: float) -> SearchResult:
+    """Format a single search result for UI"""
+    src = hit.get("_source", {})
+    score = hit.get("_score", 0)
+    
+    # Clean description
+    desc = src.get("description", "")
+    desc = desc.replace("<br />", " ").replace("<br>", " ").replace("\n", " ")
+    if len(desc) > 500:
+        desc = desc[:500] + "..."
+    
+    # Build location display
+    loc_parts = []
+    if src.get("location_1"):
+        loc_parts.append(src["location_1"])
+    if src.get("location_2"):
+        loc_parts.append(src["location_2"])
+    if src.get("location_3"):
+        loc_parts.append(src["location_3"])
+    location_display = ", ".join(loc_parts)
+    
+    # Extract coordinates
+    coords = None
+    if src.get("coordinates"):
+        try:
+            coords = ListingCoordinates(
+                lat=float(src["coordinates"].get("lat", 0)),
+                lng=float(src["coordinates"].get("log", 0))  # Note: "log" not "lng" in data
+            )
+        except:
+            pass
+    
+    # Images
+    images = src.get("src_images", []) or src.get("images", []) or []
+    # Filter out non-image URLs
+    images = [img for img in images if img and img.startswith("http") and not img.endswith(".svg")]
+    thumbnail = images[0] if images else None
+    
+    # Format date
+    valid_from = src.get("valid_from")
+    if valid_from:
+        try:
+            dt = datetime.fromisoformat(valid_from.replace("Z", "+00:00"))
+            valid_from = dt.strftime("%d/%m/%y, %H:%M")
+        except:
+            pass
+    
+    return SearchResult(
+        id=hit.get("_id", ""),
+        ad_id=src.get("ad_id"),
+        title=src.get("driver_title") or src.get("name") or "No title",
+        description=desc,
+        price=src.get("price"),
+        currency=src.get("currency", "EUR"),
+        location_1=src.get("location_1"),
+        location_2=src.get("location_2"),
+        location_3=src.get("location_3"),
+        location_display=location_display,
+        coordinates=coords,
+        categories=src.get("categories", []),
+        images=images[:10],  # Limit to 10
+        image_count=len(images),
+        thumbnail=thumbnail,
+        phone=src.get("decrypted_phone"),
+        source=src.get("ad_source") or src.get("source"),
+        url=src.get("ad_url"),
+        valid_from=valid_from,
+        relevance_score=score,
+        relevance_pct=round((score / max_score) * 100, 1) if max_score else 0,
+        relevance_tag=get_relevance_tag(score, max_score),
+        attributes=extract_attributes(src.get("attributes", {}))
+    )
+
+
+# =============================================================================
+# MAIN SEARCH FUNCTION
+# =============================================================================
+
+def execute_search(query: Dict) -> Dict:
+    """Execute search against OpenSearch"""
+    response = requests.post(
+        f"{settings.opensearch_url}/{settings.opensearch_index}/_search",
+        json=query,
+        auth=settings.opensearch_auth,
+        verify=settings.opensearch_verify_ssl,
+        timeout=10
+    )
+    if response.status_code != 200:
+        raise Exception(f"OpenSearch error: {response.status_code}")
+    return response.json()
+
+
+def search(
+    user_query: str,
+    user_id: str,
+    session_id: str,
+    size: int = 25
+) -> Dict:
+    """Main search function"""
+    
+    # Load memory
+    memory = load_memory(user_id, session_id)
+    
+    # Parse with LLM
+    parsed = parse_query_with_llm(user_query, memory)
+    
+    # Save updated memory
+    save_memory(user_id, session_id, parsed, user_query)
+    
+    # Build and execute query
+    os_query = build_opensearch_query(parsed, size)
+    results = execute_search(os_query)
+    
+    hits = results.get("hits", {}).get("hits", [])
+    total = results.get("hits", {}).get("total", {}).get("value", 0)
+    max_score = results.get("hits", {}).get("max_score") or 1.0
+    
+    # Format results
+    formatted = [format_result(hit, max_score) for hit in hits]
+    
+    return {
+        "parsed": parsed,
+        "total": total,
+        "max_score": max_score,
+        "results": formatted,
+    }
