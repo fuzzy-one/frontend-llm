@@ -1,8 +1,8 @@
 # api/models.py - Pydantic models for API request/response
 # Rich models designed for frontend UI display
 
-from typing import Optional, List, Dict, Any
-from pydantic import BaseModel, Field
+from typing import Optional, List, Dict, Any, Union
+from pydantic import BaseModel, Field, field_validator
 from datetime import datetime
 
 
@@ -46,72 +46,53 @@ class SearchFilters(BaseModel):
 # RESULT MODELS - Rich data for UI cards
 # =============================================================================
 
-class ListingCoordinates(BaseModel):
-    """Geographic coordinates"""
-    lat: Optional[float] = None
-    lng: Optional[float] = None
-
-
-class ListingAttributes(BaseModel):
-    """Property attributes extracted from listing"""
-    surface: Optional[str] = None
-    floor: Optional[str] = None
-    rooms: Optional[str] = None
-    bathrooms: Optional[str] = None
-    layout: Optional[str] = None  # decomandat/semidecomandat
-    condition: Optional[str] = None
-    heating: Optional[str] = None
-    appliances: Optional[str] = None
-    parking: Optional[str] = None
-    year_built: Optional[str] = None
-    availability: Optional[str] = None
-
-
 class SearchResult(BaseModel):
-    """Single search result - rich data for UI card display"""
+    """Single search result - streamlined for card UI"""
     
     # Identity
-    id: str = Field(..., description="Unique document ID")
+    id: str = Field(..., description="OpenSearch document ID")
     ad_id: Optional[str] = Field(None, description="Original ad ID from source")
     
-    # Main content
-    title: str = Field(..., description="Listing title")
-    description: str = Field(..., description="Listing description (truncated)")
+    @field_validator('ad_id', mode='before')
+    @classmethod
+    def coerce_ad_id(cls, v):
+        if v is None:
+            return None
+        return str(v)
+    
+    # Content
+    title: str
+    description: str = Field("", description="Truncated description")
     
     # Price
     price: Optional[float] = None
     currency: str = "EUR"
     
-    # Location
-    location_1: Optional[str] = Field(None, description="County/Region (e.g., Bucuresti, Cluj)")
-    location_2: Optional[str] = Field(None, description="City/Sector (e.g., Sector 3, Cluj-Napoca)")
-    location_3: Optional[str] = Field(None, description="Neighborhood (e.g., Titan, Pallady)")
-    location_display: str = Field("", description="Formatted location for display")
-    coordinates: Optional[ListingCoordinates] = None
+    # Location (formatted for display)
+    location: str = Field("", description="Location: City, Area")
     
-    # Categories (as tags)
-    categories: List[str] = Field(default_factory=list, description="Category tags: Vanzare, Apartamente, 3 camere")
+    # Categories (tags shown on card)
+    categories: List[str] = Field(default_factory=list, description="Tags: Inchiriere, Apartamente, 2 camere")
     
-    # Media
-    images: List[str] = Field(default_factory=list, description="Image URLs")
-    image_count: int = Field(0, description="Total number of images")
-    thumbnail: Optional[str] = Field(None, description="Primary thumbnail URL")
+    # Key attributes shown on card
+    surface: Optional[str] = None  # e.g. "58 m²"
+    phone: Optional[str] = None
+    date: Optional[str] = None  # e.g. "12/6/25, 12:25 AM"
     
-    # Contact & Source
-    phone: Optional[str] = Field(None, description="Contact phone number")
-    source: Optional[str] = Field(None, description="Source platform (romimo, etc.)")
-    url: Optional[str] = Field(None, description="Original listing URL")
+    # Images
+    images: List[str] = Field(default_factory=list)
+    image_count: int = 0
     
-    # Dates
-    valid_from: Optional[str] = Field(None, description="Listing date")
+    # Source & link
+    source: Optional[str] = None  # olx, anuntul, etc.
+    url: Optional[str] = None  # View Original link
     
-    # Relevance
-    relevance_score: float = Field(0.0, description="Raw search score")
-    relevance_pct: float = Field(0.0, description="Relevance percentage (0-100)")
-    relevance_tag: str = Field("⚪", description="Relevance emoji indicator")
+    # Relevance score (0-100) for colored bullet in UI
+    score: int = Field(0, description="Relevance score 0-100 for UI indicator")
     
-    # Rich attributes
-    attributes: ListingAttributes = Field(default_factory=ListingAttributes)
+    # Seller info (from cross-index agent lookup)
+    is_agency: bool = Field(False, description="True if seller is known agent/agency")
+    seller_type: str = Field("unknown", description="private, agent, agency, or unknown")
 
 
 # =============================================================================

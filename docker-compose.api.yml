@@ -1,0 +1,52 @@
+# docker-compose.api.yml - Smart Real Estate Search API
+version: '3.8'
+
+services:
+  search-api:
+    build:
+      context: .
+      dockerfile: api/Dockerfile
+    container_name: smart-search-api
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      # OpenSearch Configuration
+      OPENSEARCH_HOST: ${OPENSEARCH_HOST:-192.168.40.101}
+      OPENSEARCH_PORT: ${OPENSEARCH_PORT:-9200}
+      OPENSEARCH_USER: ${OPENSEARCH_USER:-admin}
+      OPENSEARCH_PASSWORD: ${OPENSEARCH_PASSWORD:-FaraParole69}
+      
+      # LLM Configuration (Ollama)
+      LLM_BASE_URL: ${LLM_BASE_URL:-http://192.168.10.115:11434}
+      LLM_MODEL: ${LLM_MODEL:-gpt-oss:20b-cloud}
+      
+      # Embedding Model (BGE-M3 in OpenSearch)
+      EMBEDDING_MODEL_ID: ${EMBEDDING_MODEL_ID:-RP2W5ZoB-XLRYbYP-LKJ}
+      
+      # Keycloak Authentication
+      AUTH_ENABLED: ${AUTH_ENABLED:-true}
+      KEYCLOAK_URL: ${KEYCLOAK_URL:-https://auth.immocloud.ro}
+      KEYCLOAK_REALM: ${KEYCLOAK_REALM:-immocloud}
+      KEYCLOAK_CLIENT_ID: ${KEYCLOAK_CLIENT_ID:-immo-search}
+      KEYCLOAK_CLIENT_SECRET: ${KEYCLOAK_CLIENT_SECRET:-kiytWUd0qXBHizJkRdRD6Fv8AZ5L3mmo}
+      
+      # API Settings
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    networks:
+      - search-network
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+networks:
+  search-network:
+    driver: bridge

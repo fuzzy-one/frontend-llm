@@ -98,13 +98,14 @@ async def decode_and_validate_token(token: str) -> TokenUser:
         )
     
     try:
+        # Note: verify_aud is disabled because tokens may be issued for different clients
+        # OpenSearch also has verify_audience: false in its config
         payload = jwt.decode(
             token,
             signing_key,
             algorithms=["RS256"],
-            audience=settings.keycloak_client_id,
             issuer=settings.keycloak_issuer,
-            options={"verify_aud": True, "verify_iss": True, "verify_exp": True}
+            options={"verify_aud": False, "verify_iss": True, "verify_exp": True}
         )
         
         user_id = payload.get("sub")
@@ -187,5 +188,10 @@ def require_role(required_role: str):
 
 
 def get_user_id_for_dls(user: TokenUser) -> str:
-    """Get user ID for Document Level Security"""
-    return user.user_id
+    """
+    Get user ID for Document Level Security.
+    Uses preferred_username to match OpenSearch's subject_key configuration.
+    """
+    # OpenSearch is configured with subject_key: "preferred_username"
+    # So we use username for DLS consistency
+    return user.username or user.user_id

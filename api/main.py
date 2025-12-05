@@ -135,6 +135,7 @@ async def search_listings(
             features=SearchFeatures(**features) if features else SearchFeatures()
         )
         
+        # Results are already SearchResult objects from api/search.py
         return SearchResponse(
             query=request.query,
             parsed_filters=filters,
@@ -145,6 +146,8 @@ async def search_listings(
         )
         
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
 

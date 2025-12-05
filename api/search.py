@@ -11,10 +11,7 @@ from typing import Dict, Any, Optional, List
 from datetime import datetime, timezone
 
 from .config import settings
-from .models import (
-    SearchResult, SearchFilters, SearchFeatures,
-    ListingAttributes, ListingCoordinates
-)
+from .models import SearchResult, SearchFilters, SearchFeatures
 
 # =============================================================================
 # CONSTANTS
@@ -512,91 +509,48 @@ def build_opensearch_query(parsed: Dict, size: int = 25) -> Dict:
 # RESULT FORMATTING
 # =============================================================================
 
-def get_relevance_tag(score: float, max_score: float) -> str:
-    """Convert score to emoji tag"""
-    if max_score == 0:
-        return "⚪"
-    pct = (score / max_score) * 100
-    if pct >= 90:
-        return "🟢"
-    elif pct >= 70:
-        return "🟡"
-    elif pct >= 50:
-        return "🟠"
-    else:
-        return "🔴"
-
-
-def extract_attributes(attrs: Dict[str, Any]) -> ListingAttributes:
-    """Extract and normalize attributes"""
-    if not attrs:
-        return ListingAttributes()
-    
-    mapping = {
-        "Suprafata utila": "surface", "Suprafata": "surface",
-        "Etaj": "floor", "Numar camere": "rooms",
-        "Compartimentare": "layout", "Stare interior": "condition",
-        "Sistem incalzire": "heating", "Incalzire": "heating",
-        "Electrocasnice": "appliances", "Locuri parcare": "parking",
-        "An constructie": "year_built", "Numar bai": "bathrooms",
-        "Disponibilitate proprietate": "availability",
-    }
-    
-    result = {}
-    for key, value in attrs.items():
-        clean_key = mapping.get(key)
-        if clean_key and isinstance(value, str):
-            result[clean_key] = value.replace("\r\n", " ").replace("\n", " ").strip()
-    
-    return ListingAttributes(**result)
-
-
 def format_result(hit: Dict, max_score: float) -> SearchResult:
-    """Format a single search result for UI"""
+    """Format a single search result for card UI - streamlined"""
     src = hit.get("_source", {})
-    score = hit.get("_score", 0)
     
-    # Clean description
-    desc = src.get("description", "")
+    # Calculate relevance score (0-100)
+    raw_score = hit.get("_score", 0)
+    score = int((raw_score / max_score) * 100) if max_score > 0 else 0
+    score = min(100, max(0, score))  # Clamp to 0-100
+    
+    # Clean description (truncate for card preview)
+    desc = src.get("description", "") or ""
     desc = desc.replace("<br />", " ").replace("<br>", " ").replace("\n", " ")
-    if len(desc) > 500:
-        desc = desc[:500] + "..."
+    if len(desc) > 300:
+        desc = desc[:300] + "..."
     
-    # Build location display
+    # Build location: "City, Area" format
     loc_parts = []
     if src.get("location_1"):
         loc_parts.append(src["location_1"])
     if src.get("location_2"):
         loc_parts.append(src["location_2"])
-    if src.get("location_3"):
-        loc_parts.append(src["location_3"])
-    location_display = ", ".join(loc_parts)
-    
-    # Extract coordinates
-    coords = None
-    if src.get("coordinates"):
-        try:
-            coords = ListingCoordinates(
-                lat=float(src["coordinates"].get("lat", 0)),
-                lng=float(src["coordinates"].get("log", 0))  # Note: "log" not "lng" in data
-            )
-        except:
-            pass
+    location = ", ".join(loc_parts)
     
     # Images
     images = src.get("src_images", []) or src.get("images", []) or []
-    # Filter out non-image URLs
     images = [img for img in images if img and img.startswith("http") and not img.endswith(".svg")]
-    thumbnail = images[0] if images else None
     
-    # Format date
+    # Format date nicely
+    date_str = None
     valid_from = src.get("valid_from")
     if valid_from:
         try:
             dt = datetime.fromisoformat(valid_from.replace("Z", "+00:00"))
-            valid_from = dt.strftime("%d/%m/%y, %H:%M")
+            date_str = dt.strftime("%m/%d/%y, %I:%M %p")
         except:
-            pass
+            date_str = valid_from
+    
+    # Extract surface from attributes
+    surface = None
+    attrs = src.get("attributes", {})
+    if isinstance(attrs, dict):
+        surface = attrs.get("Suprafata utila") or attrs.get("Suprafata") or attrs.get("suprafata_utila")
     
     return SearchResult(
         id=hit.get("_id", ""),
@@ -605,23 +559,16 @@ def format_result(hit: Dict, max_score: float) -> SearchResult:
         description=desc,
         price=src.get("price"),
         currency=src.get("currency", "EUR"),
-        location_1=src.get("location_1"),
-        location_2=src.get("location_2"),
-        location_3=src.get("location_3"),
-        location_display=location_display,
-        coordinates=coords,
-        categories=src.get("categories", []),
-        images=images[:10],  # Limit to 10
+        location=location,
+        categories=src.get("categories", []) or [],
+        surface=surface,
+        phone=src.get("decrypted_phone") or "N/A",
+        date=date_str,
+        images=images[:5],  # Limit to 5 for card
         image_count=len(images),
-        thumbnail=thumbnail,
-        phone=src.get("decrypted_phone"),
         source=src.get("ad_source") or src.get("source"),
         url=src.get("ad_url"),
-        valid_from=valid_from,
-        relevance_score=score,
-        relevance_pct=round((score / max_score) * 100, 1) if max_score else 0,
-        relevance_tag=get_relevance_tag(score, max_score),
-        attributes=extract_attributes(src.get("attributes", {}))
+        score=score,
     )
 
 
@@ -641,6 +588,73 @@ def execute_search(query: Dict) -> Dict:
     if response.status_code != 200:
         raise Exception(f"OpenSearch error: {response.status_code}")
     return response.json()
+
+
+def lookup_agents(phones: List[str]) -> Dict[str, Dict]:
+    """
+    Cross-index lookup: check which phones belong to known agents.
+    Returns dict: phone -> {is_agency, seller_type, agency_name}
+    """
+    if not phones:
+        return {}
+    
+    # Filter out invalid phones
+    valid_phones = [p for p in phones if p and p != 'N/A' and len(p) >= 10]
+    if not valid_phones:
+        return {}
+    
+    try:
+        query = {
+            "query": {
+                "terms": {"phone": valid_phones}
+            },
+            "_source": ["phone", "type", "agency_name"],
+            "size": len(valid_phones)
+        }
+        
+        response = requests.post(
+            f"{settings.opensearch_url}/agents/_search",
+            json=query,
+            auth=settings.opensearch_auth,
+            verify=settings.opensearch_verify_ssl,
+            timeout=5
+        )
+        
+        if response.status_code != 200:
+            # Agents index might not exist yet - that's ok
+            return {}
+        
+        result = response.json()
+        
+        # Build lookup dict
+        agent_lookup = {}
+        for hit in result.get('hits', {}).get('hits', []):
+            src = hit['_source']
+            agent_lookup[src['phone']] = {
+                'is_agency': True,
+                'seller_type': src.get('type', 'agent'),
+                'agency_name': src.get('agency_name')
+            }
+        
+        return agent_lookup
+        
+    except Exception as e:
+        # Don't fail search if agent lookup fails
+        print(f"Agent lookup failed: {e}")
+        return {}
+
+
+def enrich_with_agent_info(results: List[SearchResult], agent_lookup: Dict) -> List[SearchResult]:
+    """Add is_agency flag to results based on agent lookup"""
+    for result in results:
+        phone = result.phone
+        if phone in agent_lookup:
+            result.is_agency = agent_lookup[phone]['is_agency']
+            result.seller_type = agent_lookup[phone]['seller_type']
+        else:
+            result.is_agency = False
+            result.seller_type = 'private'
+    return results
 
 
 def search(
@@ -670,6 +684,11 @@ def search(
     
     # Format results
     formatted = [format_result(hit, max_score) for hit in hits]
+    
+    # Cross-index lookup: enrich with agent info
+    phones = [r.phone for r in formatted]
+    agent_lookup = lookup_agents(phones)
+    formatted = enrich_with_agent_info(formatted, agent_lookup)
     
     return {
         "parsed": parsed,
