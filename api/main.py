@@ -42,7 +42,7 @@ async def lifespan(app: FastAPI):
 # =============================================================================
 
 app = FastAPI(
-    title="Smart Real Estate Search API",
+    title="Smart Real Estate Search API for immocloud.ro",
     description="""
 Natural language search for Romanian real estate with conversation memory.
 

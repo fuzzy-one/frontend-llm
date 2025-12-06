@@ -2,6 +2,8 @@
 
 Natural language search for Romanian real estate powered by LLM query parsing and OpenSearch hybrid search.
 
+docker-compose -f docker-compose.api.yml up --build -d
+
 ## Features
 
 - 🗣️ **Natural Language Queries** - Search in Romanian: "caut apartament 2 camere in Pallady, pet friendly"
