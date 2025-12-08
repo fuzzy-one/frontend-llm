@@ -252,38 +252,38 @@ def parse_query_with_llm(user_query: str, current_context: Dict) -> Dict:
     
     prompt = f'''You are a Romanian real estate search parser. Parse the user's query into structured JSON.
 
-CURRENT SEARCH CONTEXT:
+CURRENT SEARCH CONTEXT (from previous queries in this conversation):
 {context_str}
 
 USER QUERY: "{user_query}"
 
-RULES:
-1. If the query REFINES the search (starts with "dar", "si", "doar", "numai"), preserve context and modify only mentioned fields
-2. If the query is a NEW search (mentions a new location or completely different criteria), start fresh
-3. For features (animale, fumatori, parcare, mobilat, centrala):
+CRITICAL RULES:
+1. ALWAYS preserve ALL existing context values, EXCEPT the fields explicitly mentioned in the new query
+2. If user mentions a NEW location (e.g., "sector 3", "Titan", "Pallady"), UPDATE the location field - keep all other filters
+3. If user says "acum vreau", "dar in", "pe alea din", "doar in", "schimba" - this MODIFIES only that specific filter
+4. For features (animale, fumatori, parcare, mobilat, centrala):
    - "WANT" = user wants this feature
    - "EXCLUDE" = user doesn't want this
-   - null = not mentioned
-4. For exclude_agencies:
-   - Set to true if user says: "fara agentii", "doar particulari", "nu agenti", "private only", "no agents", "fără agenție"
-   - Set to false otherwise
+   - null = not mentioned, keep existing value
+5. For exclude_agencies:
+   - Set to true if user says: "fara agentii", "doar particulari", "nu agenti", "private only", "no agents"
+   - Keep existing value if not mentioned
 
-EXAMPLES:
-- "apartament Titan fara agentii" -> exclude_agencies: true
-- "doar particulari 2 camere" -> exclude_agencies: true
-- "no agents please" -> exclude_agencies: true
-- "apartament Titan 2 camere" -> exclude_agencies: false
+EXAMPLES of REFINEMENT queries (keep all context, change only what's mentioned):
+- Context has "location": "Sector 1" -> Query: "acum vreau din sector 3" -> Output: "location": "Sector 3" (keep ALL other fields!)
+- Context has "price_max": 800 -> Query: "dar cu maxim 600 euro" -> Output: "price_max": 600 (keep ALL other fields!)
+- Context has rooms: null -> Query: "cu 2 camere" -> Output: "rooms": 2 (keep ALL other fields!)
 
-OUTPUT FORMAT (JSON only):
+OUTPUT FORMAT (JSON only - include ALL fields, preserve context for unchanged fields):
 {{
-  "location": "neighborhood or null",
+  "location": "neighborhood/sector or null if not mentioned at all",
   "city": "city or null",
   "transaction": "Vanzare" or "Inchiriere" or null,
   "property_type": "Apartamente" or "Case" or "Garsoniera" or null,
   "rooms": number or null,
   "price_min": number or null,
   "price_max": number or null,
-  "keywords": ["array of terms: modern, balcon, etc."],
+  "keywords": ["array of terms"],
   "features": {{
     "animale": "WANT" or "EXCLUDE" or null,
     "fumatori": "WANT" or "EXCLUDE" or null,
@@ -294,7 +294,7 @@ OUTPUT FORMAT (JSON only):
   "exclude_agencies": true or false
 }}
 
-Parse and output ONLY JSON:'''
+Parse and output ONLY valid JSON:'''
 
     try:
         response = httpx.post(
@@ -303,12 +303,16 @@ Parse and output ONLY JSON:'''
                 "model": settings.ollama_model,
                 "prompt": prompt,
                 "stream": False,
-                "options": {"temperature": 0.1, "num_predict": 500}
+                "options": {"temperature": 0.1, "num_predict": 2000}  # Increased for thinking models
             },
             timeout=settings.ollama_timeout
         )
         
-        result = response.json()["response"].strip()
+        raw_json = response.json()
+        result = raw_json.get("response", "").strip()
+        if not result:
+            print(f"[LLM] Empty response - model used {raw_json.get('eval_count', 0)} tokens for thinking")
+            return current_context
         
         # Extract JSON
         if "```" in result:
