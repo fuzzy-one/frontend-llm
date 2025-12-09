@@ -304,53 +304,93 @@ def generate_assistant_message(parsed: Dict, total: int, query: str) -> tuple[st
     
     # Build the message
     if total == 0:
-        # No results
+        # No results - expanded variations
         no_result_messages = [
             f"Nu am găsit {property_type} {transaction_str} care să corespundă criteriilor tale. Încearcă să lărgești aria de căutare sau să ajustezi filtrele.",
             f"Hmm, nu am găsit nimic. Poate încerci cu alte criterii sau într-o altă zonă?",
             f"Din păcate, nu există {property_type} disponibile cu aceste filtre. Vrei să încercăm altceva?",
+            f"Momentan nu apar {property_type} care să se potrivească. Pot extinde căutarea sau să-ți trimit o alertă când apar anunțuri.",
+            f"Îmi pare rău — nu am găsit rezultate. Poți încerca să scazi nivelul de filtrare sau să cauți pe un perimetru mai larg.",
+            f"Niciun rezultat pentru aceste cerințe. Îți sugerez să renunți la unele filtre sau să încerci o zonă apropiată.",
+            f"Nu sunt listări potrivite acum. Spune-mi dacă vrei să îți notific când apare ceva similar.",
+            f"Nimic găsit — poate vrei să încerci o variantă mai generală (ex: fără {rooms_str or 'număr camere specific'}).",
         ]
         return random.choice(no_result_messages), "no_results"
-    
-    # Has results - build natural message
+
+    # Has results - build natural message (expanded phrasing)
     intro_phrases = [
         f"Am găsit {total} {property_type}",
         f"Sunt {total} {property_type} disponibile",
         f"Iată {total} {property_type}",
         f"Am identificat {total} {property_type}",
+        f"Există aproximativ {total} {property_type}",
+        f"Găsit: {total} {property_type}",
+        f"Rezultate: {total} {property_type}",
+        f"Afișez {total} {property_type} potrivite pentru căutarea ta",
+        f"Am localizat {total} {property_type} care se potrivesc criteriilor tale",
+        f"Sunt disponibile {total} {property_type} în baza căutării tale",
     ]
-    
+
     message_parts = [random.choice(intro_phrases)]
-    
+
     if transaction_str:
-        message_parts.append(transaction_str)
+        # multiple ways to attach transaction
+        tx_variants = [transaction_str, f"({transaction_str})", transaction_str]
+        message_parts.append(random.choice(tx_variants))
     if location_str:
-        message_parts.append(f"în {location_str}")
+        # location may be appended in multiple forms
+        loc_variants = [f"în {location_str}", f"zona {location_str}", f"pe {location_str}"]
+        message_parts.append(random.choice(loc_variants))
     if price_str:
-        message_parts.append(price_str)
+        price_variants = [price_str, f"cu preț {price_str}", price_str]
+        message_parts.append(random.choice(price_variants))
     if rooms_str:
         message_parts.append(rooms_str)
     if feature_strs:
         message_parts.append(", ".join(feature_strs))
-    
+
     message = " ".join(message_parts) + "."
-    
-    # Add helpful suggestions for refinement
-    if total > 50:
+
+    # Add helpful suggestions for refinement (expanded)
+    if total > 200:
+        heavy_suggestions = [
+            " Poți rafina căutarea specificând zona exactă sau intervalul de preț.",
+            " Încearcă să adaugi mai multe detalii pentru rezultate mai precise.",
+            " Spune-mi dacă vrei să filtrez după numărul de camere sau alte facilități.",
+            " Dacă vrei, pot selecta doar anunțurile cu poze sau cu preț în intervalul X–Y.",
+            " Sunt multe rezultate — vrei să le limitez la cele cu parcare sau mobilate?",
+            " Ai vrea să vezi doar oferte noi (ultimele 24h) sau doar particulari?",
+        ]
+        message += random.choice(heavy_suggestions)
+    elif total > 50:
         suggestions = [
             " Poți rafina căutarea specificând zona exactă sau intervalul de preț.",
             " Încearcă să adaugi mai multe detalii pentru rezultate mai precise.",
             " Spune-mi dacă vrei să filtrez după numărul de camere sau alte facilități.",
+            " Dacă dorești, pot exclude agențiile sau afișa doar anunțuri cu fotografii.",
+            " Ai vrea să vezi doar proprietăți publicate recent?",
+            " Pot restrânge căutarea la un buget mai mic sau la anumite tipuri de anunțuri.",
         ]
         message += random.choice(suggestions)
+    elif total > 10 and total <= 50:
+        mid_suggestions = [
+            " Sunt câteva opțiuni bune — verifică-le mai jos și spune-mi dacă vrei să le rafinăm.",
+            " Am găsit o selecție rezonabilă; pot afișa doar cele mai relevante sau cele cu poze.",
+            " Dacă vrei, pot ordona după preț sau suprafață pentru a le compara mai ușor.",
+            " Vrei să vezi doar anunțuri fără agenții sau doar particulari?",
+        ]
+        message += random.choice(mid_suggestions)
     elif total > 0 and total <= 10:
         encouragements = [
             " Arată bine! Verifică rezultatele de mai jos.",
             " Câteva opțiuni interesante! 👇",
             " Iată ce am găsit pentru tine.",
+            " Sunt câteva variante — dacă vrei, pot să-ți evidențiez cele mai apropiate sau cele mai ieftine.",
+            " Sunt puține rezultate, dar pot extinde aria de căutare dacă dorești.",
+            " Opțiunile par promițătoare — vrei să setez notificări pentru anunțuri noi?",
         ]
         message += random.choice(encouragements)
-    
+
     return message, "results"
 
 
@@ -507,8 +547,8 @@ def validate_parsed_result(parsed: Dict, context: Dict, user_query: str = "") ->
 # OPENSEARCH QUERY BUILDER
 # =============================================================================
 
-def build_opensearch_query(parsed: Dict, size: int = 25) -> Dict:
-    """Build OpenSearch query from parsed filters"""
+def build_opensearch_query(parsed: Dict, size: int = 25, offset: int = 0) -> Dict:
+    """Build OpenSearch query from parsed filters with pagination"""
     
     must = []
     should = []
@@ -618,6 +658,7 @@ def build_opensearch_query(parsed: Dict, size: int = 25) -> Dict:
     # Build final query
     query = {
         "size": size,
+        "from": offset,
         "query": {
             "bool": {
                 "must": must if must else [{"match_all": {}}],
@@ -798,6 +839,7 @@ def search(
     user_id: str,
     session_id: str,
     size: int = 25,
+    offset: int = 0,
     exclude_agencies_override: Optional[bool] = None
 ) -> Dict:
     """
@@ -824,7 +866,7 @@ def search(
     save_memory(user_id, session_id, parsed, user_query)
     
     # Build and execute query
-    os_query = build_opensearch_query(parsed, size)
+    os_query = build_opensearch_query(parsed, size, offset)
     results = execute_search(os_query)
     
     hits = results.get("hits", {}).get("hits", [])

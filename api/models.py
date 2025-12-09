@@ -13,7 +13,8 @@ from datetime import datetime
 class SearchRequest(BaseModel):
     """Search request with natural language query"""
     query: str = Field(..., description="Natural language search query")
-    size: int = Field(25, ge=1, le=100, description="Number of results")
+    size: int = Field(25, ge=1, le=100, description="Number of results per page")
+    offset: int = Field(0, ge=0, description="Offset for pagination (skip first N results)")
     exclude_agencies: Optional[bool] = Field(None, description="UI toggle: true=hide agencies, false=show all, null=use query parsing")
 
 

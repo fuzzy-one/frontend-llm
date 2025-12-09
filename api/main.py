@@ -118,6 +118,7 @@ async def search_listings(
             user_id=user_id,
             session_id=session_id,
             size=request.size,
+            offset=request.offset,
             exclude_agencies_override=request.exclude_agencies  # UI toggle takes precedence
         )
         
