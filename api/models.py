@@ -114,6 +114,8 @@ class SearchResponse(BaseModel):
     # Chat-like response message from the assistant
     message: str = Field("", description="Natural language response summarizing the search")
     message_type: str = Field("results", description="Type: results, clarification, no_results, error")
+    # OpenSearch query for frontend caching (enables fast pagination without re-calling LLM)
+    opensearch_query: Optional[Dict[str, Any]] = Field(None, description="Built OpenSearch query for frontend caching")
 
 
 class SessionInfo(BaseModel):

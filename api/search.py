@@ -899,4 +899,5 @@ def search(
         "results": formatted,
         "message": message,
         "message_type": message_type,
+        "opensearch_query": os_query,  # Return query for frontend caching (fast pagination)
     }

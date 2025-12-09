@@ -147,7 +147,8 @@ async def search_listings(
             session_id=session_id,
             user_id=user_id,
             message=result.get("message", ""),
-            message_type=result.get("message_type", "results")
+            message_type=result.get("message_type", "results"),
+            opensearch_query=result.get("opensearch_query")  # For frontend caching (fast pagination)
         )
         
     except Exception as e:
