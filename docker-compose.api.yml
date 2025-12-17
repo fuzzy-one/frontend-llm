@@ -27,6 +27,7 @@ services:
       # Keycloak Authentication
       AUTH_ENABLED: ${AUTH_ENABLED:-true}
       KEYCLOAK_URL: ${KEYCLOAK_URL:-https://auth.immocloud.ro}
+      KEYCLOAK_INTERNAL_URL: http://auth-keycloak-1:8080
       KEYCLOAK_REALM: ${KEYCLOAK_REALM:-immocloud}
       KEYCLOAK_CLIENT_ID: ${KEYCLOAK_CLIENT_ID:-immo-search}
       KEYCLOAK_CLIENT_SECRET: ${KEYCLOAK_CLIENT_SECRET:-kiytWUd0qXBHizJkRdRD6Fv8AZ5L3mmo}
@@ -41,6 +42,7 @@ services:
       start_period: 10s
     networks:
       - search-network
+      - imo_network
     logging:
       driver: "json-file"
       options:
@@ -50,3 +52,5 @@ services:
 networks:
   search-network:
     driver: bridge
+  imo_network:
+    external: true

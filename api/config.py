@@ -17,6 +17,7 @@ class Settings(BaseSettings):
     allow_anonymous: bool = True
     
     keycloak_url: str = "https://keycloak.example.com"
+    keycloak_internal_url: Optional[str] = None
     keycloak_realm: str = "master"
     keycloak_client_id: str = "real-estate-search"
     
@@ -26,7 +27,9 @@ class Settings(BaseSettings):
     
     @property
     def keycloak_jwks_url(self) -> str:
-        return f"{self.keycloak_issuer}/protocol/openid-connect/certs"
+        # Use internal URL if available for fetching certs, otherwise public
+        base_url = self.keycloak_internal_url or self.keycloak_url
+        return f"{base_url}/realms/{self.keycloak_realm}/protocol/openid-connect/certs"
     
     # ==========================================================================
     # OPENSEARCH
@@ -52,7 +55,8 @@ class Settings(BaseSettings):
     # ==========================================================================
     ollama_url: str = "http://192.168.10.115:11434"
     ollama_model: str = "gpt-oss:20b-cloud"
-    ollama_timeout: int = 30
+    ollama_timeout: int = 120
+    admin_api_key: str = "secret-admin-key"
     
     # ==========================================================================
     # API SERVER

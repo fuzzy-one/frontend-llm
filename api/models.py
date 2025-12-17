@@ -18,6 +18,12 @@ class SearchRequest(BaseModel):
     exclude_agencies: Optional[bool] = Field(None, description="UI toggle: true=hide agencies, false=show all, null=use query parsing")
 
 
+class AddAgentRequest(BaseModel):
+    """Request to manually adding an agent"""
+    phone: str = Field(..., description="Phone number to blacklist")
+    agency_name: str = Field("Manual Report", description="Name of agent/agency")
+
+
 # =============================================================================
 # FILTER MODELS
 # =============================================================================

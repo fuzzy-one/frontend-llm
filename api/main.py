@@ -5,7 +5,7 @@ import uuid
 from typing import Optional, List
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException, Depends, Query
+from fastapi import FastAPI, HTTPException, Depends, Query, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 import requests
 
@@ -16,12 +16,15 @@ from .auth import (
 )
 from .models import (
     SearchRequest, SearchResponse, SearchFilters, SearchFeatures,
-    SearchResult, SessionInfo, HistoryItem, UserInfo
+    SearchResult, SessionInfo, HistoryItem, UserInfo, AddAgentRequest
 )
 from .search import (
     search, create_empty_memory, load_memory, save_memory,
     delete_memory, ensure_memory_index
 )
+from .normalize_data import normalize_phone
+from datetime import datetime
+import json
 
 
 # =============================================================================
@@ -318,6 +321,129 @@ async def get_current_user_info(user: TokenUser = Depends(get_current_user)):
         groups=user.groups,
         is_anonymous=isinstance(user, AnonymousUser)
     )
+
+
+# =============================================================================
+# ADMIN
+# =============================================================================
+
+@app.post("/admin/normalize-phones")
+async def trigger_normalization(
+    background_tasks: BackgroundTasks, 
+    key: str = Query(..., description="Admin API Key")
+):
+    """Async trigger for phone normalization"""
+    # Simple auth check (could be improved)
+    if key != settings.admin_api_key: # Assuming this exists or we use a hardcoded one for now
+         raise HTTPException(status_code=403, detail="Invalid admin key")
+
+    from .normalize_data import normalize_phones_task
+    background_tasks.add_task(normalize_phones_task)
+    return {"message": "Normalization job started in background"}
+
+@app.post("/admin/populate-agents")
+async def trigger_populate_agents(
+    background_tasks: BackgroundTasks, 
+    key: str = Query(..., description="Admin API Key")
+):
+    """Async trigger for rebuilding agents index"""
+    if key != settings.admin_api_key:
+         raise HTTPException(status_code=403, detail="Invalid admin key")
+
+    from .populate_agents import populate_agents_task
+    background_tasks.add_task(populate_agents_task)
+    return {"message": "Agent population job started in background"}
+
+
+@app.post("/admin/add-agent")
+async def add_agent_manual(
+    request: AddAgentRequest,
+    user: TokenUser = Depends(get_current_user)
+):
+    """
+    Manually add a phone number to the agents index and update existing listings.
+    Restricted to specific user.
+    """
+    ALLOWED_USER = "vladxpetrescu@gmail.com"
+    
+    # 1. Auth Check - strict check on email
+    if not user.email or user.email.lower() != ALLOWED_USER.lower():
+        raise HTTPException(status_code=403, detail="You are not authorized to perform this action.")
+    
+    # 2. Validation
+    clean_phone = normalize_phone(request.phone)
+    if not clean_phone:
+        raise HTTPException(status_code=400, detail="Invalid phone number format")
+        
+    # 3. Index into 'agents'
+    try:
+        doc = {
+            "phone": clean_phone,
+            "agency_name": request.agency_name,
+            "type": "agency",
+            "reported_by": user.email,
+            "reported_at": datetime.utcnow().isoformat()
+        }
+        
+        # Use phone as ID to enforce uniqueness
+        requests.put(
+            f"{settings.opensearch_url}/agents/_doc/{clean_phone}",
+            json=doc,
+            auth=settings.opensearch_auth,
+            verify=settings.opensearch_verify_ssl,
+            timeout=5
+        )
+        
+        # 4. Trigger update on existing listings
+        # Use update_by_query to find all docs with this phone and set is_agency=true
+        update_query = {
+            "query": {
+                "term": {
+                    "decrypted_phone.keyword": clean_phone
+                }
+            },
+            "script": {
+                "source": "ctx._source.is_agency = true",
+                "lang": "painless"
+            }
+        }
+        
+        # Check if we need keyword or text field. In 'real-estate-*', decrypted_phone is usually text+keyword.
+        # Check mapping or just try 'decrypted_phone' if keyword is not set.
+        # But 'term' query works best on 'keyword'.
+        # Let's try matching both to be safe or just use matching query.
+        
+        # Better query:
+        update_body = {
+            "query": {
+                "match": {"decrypted_phone": clean_phone}
+            },
+            "script": {
+                "source": "ctx._source.is_agency = true",
+                "lang": "painless"
+            }
+        }
+        
+        resp = requests.post(
+            f"{settings.opensearch_url}/real-estate-*/_update_by_query?conflicts=proceed",
+            json=update_body,
+            auth=settings.opensearch_auth,
+            verify=settings.opensearch_verify_ssl,
+            timeout=30 # longer timeout for bulk update
+        )
+        
+        updated_count = 0
+        if resp.status_code == 200:
+            updated_count = resp.json().get("updated", 0)
+        
+        return {
+            "message": f"Agent added successfully. Phone: {clean_phone}",
+            "updated_listings": updated_count,
+            "doc": doc
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 # =============================================================================
