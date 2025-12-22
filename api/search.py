@@ -655,6 +655,12 @@ def build_opensearch_query(parsed: Dict, size: int = 25, offset: int = 0) -> Dic
             }
         })
     
+    # Exclude Agencies - Move from Python-side to OpenSearch-side
+    if parsed.get("exclude_agencies"):
+        must_not.append({
+            "term": {"is_agency": "true"}
+        })
+    
     # Build final query
     query = {
         "size": size,
@@ -876,18 +882,10 @@ def search(
     # Format results
     formatted = [format_result(hit, max_score) for hit in hits]
     
-    # Cross-index lookup: enrich with agent info
+    # Cross-index lookup: enrich with agent info (For UI labels Only)
     phones = [r.phone for r in formatted]
     agent_lookup = lookup_agents(phones)
     formatted = enrich_with_agent_info(formatted, agent_lookup)
-    
-    # Apply exclude_agencies filter (post-filter after enrichment)
-    if parsed.get("exclude_agencies"):
-        original_count = len(formatted)
-        formatted = [r for r in formatted if not r.is_agency]
-        excluded_count = original_count - len(formatted)
-        if excluded_count > 0:
-            print(f"Excluded {excluded_count} agency listings")
     
     # Generate assistant message
     message, message_type = generate_assistant_message(parsed, total, user_query)

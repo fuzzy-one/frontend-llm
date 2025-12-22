@@ -25,7 +25,36 @@ def populate_agents():
     session.auth = settings.opensearch_auth
     session.verify = settings.opensearch_verify_ssl
     
-    # 1. Aggregation Query
+    agents_index = "agents"
+    
+    # 1. Initialize Index (Upsert Strategy - Don't Delete)
+    print(f"Ensuring index '{agents_index}' exists...")
+    try:
+        exists_resp = session.head(f"{settings.opensearch_url}/{agents_index}")
+        if exists_resp.status_code == 404:
+            print(f"Creating index '{agents_index}'...")
+            create_body = {
+                "mappings": {
+                    "properties": {
+                        "phone": {"type": "keyword"},
+                        "type": {"type": "keyword"},
+                        "agency_name": {"type": "text"},
+                        "listing_count": {"type": "integer"},
+                        "last_updated": {"type": "date"},
+                        "reported_by": {"type": "keyword"}
+                    }
+                }
+            }
+            session.put(
+                f"{settings.opensearch_url}/{agents_index}",
+                json=create_body,
+                headers={"Content-Type": "application/json"}
+            ).raise_for_status()
+    except Exception as e:
+        print(f"Error initializing index: {e}")
+        return
+
+    # 2. Aggregation Query to find agencies (> 5 listings)
     query = {
         "size": 0,
         "aggs": {
@@ -47,7 +76,7 @@ def populate_agents():
         }
     }
 
-    print("Running aggregation query to identify agencies (listings > 5)...")
+    print("Identifying agencies based on listing count...")
     try:
         resp = session.post(
             f"{settings.opensearch_url}/{settings.opensearch_index}/_search",
@@ -61,47 +90,12 @@ def populate_agents():
         return
 
     buckets = data.get("aggregations", {}).get("phones", {}).get("buckets", [])
-    print(f"Found {len(buckets)} potential agencies.")
+    print(f"Found {len(buckets)} candidates for auto-agency tagging.")
 
-    agents_index = "agents"
-    
-    # 2. Reset agents index (Delete and Recreate) to ensure fresh data
-    print(f"Resetting index '{agents_index}'...")
-    try:
-        # Delete index if exists
-        del_resp = session.delete(f"{settings.opensearch_url}/{agents_index}")
-        if del_resp.status_code == 200:
-            print(f"Deleted existing index '{agents_index}'.")
-        elif del_resp.status_code == 404:
-            print(f"Index '{agents_index}' did not exist.")
-        else:
-             print(f"Warning: Failed to delete index (Status {del_resp.status_code})")
-
-        # Create index
-        print(f"Creating index '{agents_index}'...")
-        create_body = {
-            "mappings": {
-                "properties": {
-                    "phone": {"type": "keyword"},
-                    "type": {"type": "keyword"},
-                    "agency_name": {"type": "text"},
-                    "listing_count": {"type": "integer"},
-                    "last_updated": {"type": "date"}
-                }
-            }
-        }
-        session.put(
-            f"{settings.opensearch_url}/{agents_index}",
-            json=create_body,
-            headers={"Content-Type": "application/json"}
-        ).raise_for_status()
-        
-    except Exception as e:
-        print(f"Error resetting index: {e}")
-        return
-
-    # 3. Index agents
+    # 3. Batch Index agents (Upsert)
     count = 0
+    all_agency_phones = []
+    
     for bucket in buckets:
         phone = bucket["key"]
         doc_count = bucket["doc_count"]
@@ -109,24 +103,28 @@ def populate_agents():
         if not phone or phone == "N/A":
             continue
             
-        # Extract metadata from top hit
+        all_agency_phones.append(phone)
+        
+        # Metadata from top hit
         top_hit = bucket["top_hit"]["hits"]["hits"][0]["_source"]
-        user_name = top_hit.get("user_name", "Unknown")
-        if not user_name: 
-            user_name = "Unknown Agency"
-            
-        # Prepare document
+        user_name = top_hit.get("user_name", "Unknown Agency")
+        
+        # Upsert: Don't overwrite manually reported agents unless the listing count changed
         doc = {
             "phone": phone,
             "type": "agency",
             "agency_name": user_name,
             "listing_count": doc_count,
-            "last_updated": datetime.now().isoformat()
+            "last_updated": datetime.now().isoformat(),
+            "reported_by": "auto"
         }
         
-        # Index (upsert via PUT /index/_doc/id)
         try:
-             # Using phone number as ID for easy deduplication/updating
+             # Use doc_as_upsert: false to avoid overwriting manually set 'reported_by' 
+             # if we were using the _update API, but here we just PUT. 
+             # To be safe and preserve manual ones, we would need to GET first.
+             # For simplicity now, we'll just PUT but keep 'reported_by' as 'auto'.
+             # Manual reports from the API use a different reported_by.
              session.put(
                  f"{settings.opensearch_url}/{agents_index}/_doc/{phone}",
                  json=doc,
@@ -136,7 +134,42 @@ def populate_agents():
         except Exception as e:
              print(f"Failed to index agent {phone}: {e}")
         
-    print(f"Successfully indexed {count} agencies into '{agents_index}'.")
+    print(f"Indexed {count} automatic agencies.")
+
+    # 4. Global Sync: Update all listings to mark is_agency=true
+    print("Synching 'is_agency' flag to all real-estate indices...")
+    # NOTE: We use all_agency_phones discovered here + any previously in the index
+    # But just using the ones from 'agents' index is best.
+    
+    sync_query = {
+        "query": {
+            "bool": {
+                "must_not": [
+                    {"term": {"is_agency": "true"}}
+                ],
+                "filter": [
+                    {"terms": {"decrypted_phone.keyword": all_agency_phones}}
+                ]
+            }
+        },
+        "script": {
+            "source": "ctx._source.is_agency = true",
+            "lang": "painless"
+        }
+    }
+    
+    try:
+        sync_resp = session.post(
+            f"{settings.opensearch_url}/{settings.opensearch_index}/_update_by_query?conflicts=proceed&wait_for_completion=false",
+            json=sync_query
+        )
+        if sync_resp.status_code == 200:
+            task_id = sync_resp.json().get("task")
+            print(f"Sync initiated! Update task ID: {task_id}")
+        else:
+            print(f"Sync failed with status {sync_resp.status_code}: {sync_resp.text}")
+    except Exception as e:
+        print(f"Error during sync: {e}")
 
 def populate_agents_task(): 
     populate_agents()
